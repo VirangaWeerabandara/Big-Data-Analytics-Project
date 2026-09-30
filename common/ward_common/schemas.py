@@ -98,3 +98,109 @@ def validate_vitals_event(event: Any, known_patients: set[str] | None = None) ->
             errors.append(f"bad_timestamp:{name}")
 
     return errors
+
+
+# --------------------------------------------------------------------------
+# Daily lab results (batch source)
+# --------------------------------------------------------------------------
+
+LAB_FILE_COLUMNS: tuple[str, ...] = (
+    "sample_id",
+    "patient_id",
+    "test_type",
+    "result_value",
+    "unit",
+    "reference_range",
+    "collected_at",
+)
+
+LAB_FILE_PREFIX = "labs_"  # labs_YYYY-MM-DD.csv, one file per simulated day
+
+
+def lab_file_name(day) -> str:
+    return f"{LAB_FILE_PREFIX}{day.isoformat()}.csv"
+
+
+class LabTest:
+    """Catalogue entry for one test type.
+
+    `reference` is the clinical normal range printed on the report (sex-specific
+    where it differs); `plausible` is the physical limit beyond which the value
+    must be a transcription/instrument error.
+    """
+
+    def __init__(self, unit: str, reference: dict[str, str], plausible: tuple[float, float]) -> None:
+        self.unit = unit
+        self.reference = reference
+        self.plausible = plausible
+
+    def reference_for(self, sex: str) -> str:
+        return self.reference.get(sex, self.reference["*"])
+
+
+LAB_TESTS: dict[str, LabTest] = {
+    "WBC": LabTest("10^9/L", {"*": "4.0-11.0"}, (0.0, 200.0)),
+    "CRP": LabTest("mg/L", {"*": "<5"}, (0.0, 500.0)),
+    "LACTATE": LabTest("mmol/L", {"*": "0.5-2.0"}, (0.0, 30.0)),
+    "CREATININE": LabTest("umol/L", {"M": "59-104", "F": "45-84", "*": "45-104"}, (10.0, 2000.0)),
+    "POTASSIUM": LabTest("mmol/L", {"*": "3.5-5.3"}, (1.5, 10.0)),
+    "HAEMOGLOBIN": LabTest("g/L", {"M": "130-180", "F": "115-165", "*": "115-180"}, (30.0, 250.0)),
+    "TROPONIN": LabTest("ng/L", {"*": "<14"}, (0.0, 100000.0)),
+}
+
+_RANGE_PATTERN = re.compile(r"^\s*(?:(?P<low>\d+(?:\.\d+)?)\s*-\s*(?P<high>\d+(?:\.\d+)?)|<\s*(?P<upper>\d+(?:\.\d+)?))\s*$")
+
+
+def parse_reference_range(text: Any) -> tuple[float, float] | None:
+    """'4.0-11.0' -> (4.0, 11.0); '<5' -> (0.0, 5.0); anything else -> None."""
+    if not isinstance(text, str):
+        return None
+    match = _RANGE_PATTERN.match(text)
+    if not match:
+        return None
+    if match.group("upper") is not None:
+        return 0.0, float(match.group("upper"))
+    low, high = float(match.group("low")), float(match.group("high"))
+    return (low, high) if low < high else None
+
+
+def validate_lab_row(row: dict, known_patients: set[str] | None = None, file_day=None) -> list[str]:
+    """Row-level data-quality check for one CSV row (all values arrive as strings)."""
+    errors: list[str] = []
+    for name in LAB_FILE_COLUMNS:
+        value = row.get(name)
+        if value is None or str(value).strip() == "":
+            errors.append(f"missing:{name}")
+
+    pid = (row.get("patient_id") or "").strip()
+    if pid:
+        if not PATIENT_ID_PATTERN.match(pid):
+            errors.append("bad_patient_id")
+        elif known_patients is not None and pid not in known_patients:
+            errors.append("unknown_patient")
+
+    test = LAB_TESTS.get((row.get("test_type") or "").strip().upper())
+    if row.get("test_type") and test is None:
+        errors.append("unknown_test")
+
+    raw_value = (row.get("result_value") or "").strip()
+    if raw_value:
+        try:
+            value = float(raw_value)
+        except ValueError:
+            errors.append("non_numeric_result")
+        else:
+            if test is not None and not test.plausible[0] <= value <= test.plausible[1]:
+                errors.append("implausible_result")
+
+    if row.get("reference_range") and parse_reference_range(row["reference_range"]) is None:
+        errors.append("bad_reference_range")
+
+    if row.get("collected_at"):
+        collected = _parse_ts(row["collected_at"])
+        if collected is None:
+            errors.append("bad_collected_at")
+        elif file_day is not None and collected.date() != file_day:
+            errors.append("collected_outside_file_day")
+
+    return errors

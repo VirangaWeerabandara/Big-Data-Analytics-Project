@@ -114,7 +114,53 @@ make logs s=vitals-simulator  # includes deterioration_started / _resolved event
 curl localhost:8001/metrics   # producer metrics
 ```
 
-_Steps 3–7 (lab files, streaming job, DAGs, API) will be documented here as they are built._
+### Lab simulator (daily batch source)
+
+The `lab-simulator` service writes one CSV per simulated day to `data/landing/`:
+`labs_YYYY-MM-DD.csv` holds results **collected on** that day and is uploaded at 06:00
+(simulated) the next morning — "yesterday's labs".
+
+```csv
+sample_id,patient_id,test_type,result_value,unit,reference_range,collected_at
+20260104-P014-AM,P014,CRP,181.9,mg/L,<5,2026-01-04T07:41:12Z
+```
+
+The brief's five columns plus `sample_id` (one blood sample → several tests) and `unit`.
+
+| Test | Unit | Reference range |
+|---|---|---|
+| WBC | 10^9/L | 4.0–11.0 |
+| CRP | mg/L | <5 |
+| LACTATE | mmol/L | 0.5–2.0 |
+| CREATININE | umol/L | 59–104 (M), 45–84 (F) |
+| POTASSIUM | mmol/L | 3.5–5.3 |
+| HAEMOGLOBIN | g/L | 130–180 (M), 115–165 (F) |
+| TROPONIN | ng/L | <14 |
+
+- Results follow the same hidden storyline as the vitals (same seed), with realistic lags:
+  lactate and haemoglobin respond immediately, CRP peaks ~18 simulated hours later.
+- Everyone gets morning bloods (routine panel); unwell patients also get lactate/troponin and
+  an evening re-check.
+- ~3% bad rows: missing or unknown patient, non-numeric (`haemolysed`), implausible values,
+  unknown test codes, malformed reference ranges or timestamps, wrong day, duplicate rows.
+- ~10% of files arrive 2–8 simulated hours late and ~5% never arrive.
+- Files are written atomically (temp file + rename) and are byte-for-byte reproducible.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LAB_UPLOAD_HOUR` | 6 | Simulated hour on D+1 when day D's file is uploaded |
+| `LAB_LATE_RATE` / `LAB_LATE_MAX_HOURS` | 0.10 / 8 | Late uploads |
+| `LAB_MISSING_RATE` | 0.05 | Files that never arrive |
+| `LAB_BAD_ROW_RATE` | 0.03 | Corrupted rows |
+
+```bash
+make landing                       # files in landing/ archive/ quarantine/
+make lab-dry d=2026-01-04          # print a day's CSV without writing it
+make lab-day d=2026-01-04 f=--force   # (re)deliver a day now, e.g. after a "missing" day
+curl localhost:8002/metrics        # lab_files_written_total, lab_files_withheld_total, ...
+```
+
+_Steps 4–7 (streaming job, DAGs, API) will be documented here as they are built._
 
 ## Reproducing results
 

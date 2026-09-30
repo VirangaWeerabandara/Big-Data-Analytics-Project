@@ -186,6 +186,37 @@ services:
       clock-init:
         condition: service_completed_successfully
 
+  lab-simulator:
+    image: ward-vitals/simulators:local
+    build:
+      context: .
+      dockerfile: simulators/Dockerfile
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *default-logging
+    command: ["python", "-m", "ward_sim.lab_generator"]
+    environment:
+      <<: [*ward-db-env, *clock-env]
+      # Same roster settings as vitals-simulator, so both describe the same patients.
+      SIM_PATIENTS: ${SIM_PATIENTS:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_DETERIORATING_FRACTION: ${SIM_DETERIORATING_FRACTION:-0.5}
+      DATA_DIR: /data
+      LAB_UPLOAD_HOUR: ${LAB_UPLOAD_HOUR:-6}
+      LAB_LATE_RATE: ${LAB_LATE_RATE:-0.10}
+      LAB_LATE_MAX_HOURS: ${LAB_LATE_MAX_HOURS:-8}
+      LAB_MISSING_RATE: ${LAB_MISSING_RATE:-0.05}
+      LAB_BAD_ROW_RATE: ${LAB_BAD_ROW_RATE:-0.03}
+      LAB_MAX_BACKFILL_DAYS: ${LAB_MAX_BACKFILL_DAYS:-2}
+      LAB_METRICS_PORT: "8002"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:${LAB_METRICS_HOST_PORT:-8002}:8002"
+    depends_on:
+      clock-init:
+        condition: service_completed_successfully
+
   # --------------------------------------------------------------- processing
   spark:
     build:

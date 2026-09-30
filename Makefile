@@ -8,7 +8,8 @@ VENV := .venv
 
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
-        topics offsets consume clock-show clock-pause spark-smoke sim-dry venv test
+        topics offsets consume clock-show clock-pause spark-smoke sim-dry \
+        landing lab-day lab-dry venv test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -76,6 +77,17 @@ spark-smoke: ## Run the Spark connectivity smoke check
 
 sim-dry: ## Print 5 s of simulated vitals to the terminal (no Kafka, no DB)
 	$(COMPOSE) run --rm --no-deps vitals-simulator python -m ward_sim.vitals_producer --dry-run --duration 5
+
+landing: ## List lab files in landing/, archive/ and quarantine/
+	@for d in landing archive quarantine; do echo "data/$$d:"; ls -1 data/$$d | grep -v '^\.' | sed 's/^/  /'; done
+
+lab-day: ## Drop the lab file for one simulated day now (make lab-day d=2026-01-05 [f=--force])
+	@test -n "$(d)" || { echo "usage: make lab-day d=YYYY-MM-DD"; exit 1; }
+	$(COMPOSE) run --rm --no-deps lab-simulator python -m ward_sim.lab_generator --day $(d) $(f)
+
+lab-dry: ## Print the lab CSV for one simulated day (make lab-dry d=2026-01-05)
+	@test -n "$(d)" || { echo "usage: make lab-dry d=YYYY-MM-DD"; exit 1; }
+	@$(COMPOSE) run --rm --no-deps lab-simulator python -m ward_sim.lab_generator --day $(d) --dry-run
 
 # ----------------------------------------------------------------- tests
 venv: ## Create a local virtualenv for tests
