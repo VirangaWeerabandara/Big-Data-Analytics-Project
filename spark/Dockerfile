@@ -14,7 +14,10 @@ ADD --chmod=644 ${MAVEN}/org/apache/commons/commons-pool2/2.12.1/commons-pool2-2
 
 COPY spark/requirements.txt /tmp/requirements.txt
 COPY common /tmp/common
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt /tmp/common \
+# Ubuntu 22.04's pip 22.0 mis-builds pyproject-only packages (installs them as
+# "UNKNOWN"), so upgrade pip before installing our shared package.
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir -r /tmp/requirements.txt /tmp/common \
     && rm -rf /tmp/common /tmp/requirements.txt
 
 COPY spark/jobs /opt/app/jobs

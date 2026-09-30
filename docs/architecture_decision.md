@@ -182,15 +182,25 @@ All components share one definition of "simulated time" (implemented once in the
 |---|---|---|
 | `SIM_DAY_SECONDS` | `300` | Real seconds per simulated day (1 sim day = 5 real min) |
 | `SIM_START_DATE` | `2026-01-01` | Simulated date at the clock anchor |
-| anchor | stored in Postgres table `sim_clock` | Real UTC instant that maps to `SIM_START_DATE 00:00` |
+| anchor | Postgres table `sim_clock` (one row) | (`anchor_real`, `anchor_sim`) pair, plus `paused_at` |
 
 ```
-speedup  = 86400 / SIM_DAY_SECONDS            # 288 by default
-sim_now  = SIM_START + (real_now − anchor) × speedup
+speedup  = 86400 / sim_day_seconds            # 288 by default
+sim_now  = anchor_sim + (min(real_now, paused_at) − anchor_real) × speedup
 ```
 
-- The anchor is written **once** by an init step (`INSERT … ON CONFLICT DO NOTHING`) so every
-  container, including restarts, agrees on the same simulated time. `make clock-reset` rewrites it.
+- The anchor lives in the database, not in each container, so every component computes the
+  same simulated time. Implemented once in `ward_common.sim_clock` (Python) and mirrored by the
+  SQL function `sim_now()` (for Grafana and ad-hoc queries).
+- The one-shot `clock-init` service runs on every `make up`:
+  - empty table → anchor `SIM_START_DATE 00:00` to the current real time;
+  - existing row → **re-anchor at the current simulated time**, so the clock continues
+    without a jump (this also makes a changed `SIM_DAY_SECONDS` take effect smoothly).
+- `make down` sets `paused_at` first, so simulated days are not "lost" while the stack is
+  offline. `make clean` deletes the table with everything else and the next start begins at
+  `SIM_START_DATE` again.
+- Long-running components re-read the anchor every `SIM_CLOCK_REFRESH_SECONDS` (30 s) and keep
+  the last known value during a brief database outage.
 - **All event timestamps are simulated time.** Spark windows, watermarks, lab `collected_at`,
   report dates and API responses are all in sim time. Real time is only used for
   infrastructure concerns (Prometheus scrape, alert "no data for N real minutes").
@@ -321,24 +331,28 @@ consistency argument in code.
 
 ---
 
-## 11. Proposed repository layout
+## 11. Repository layout
 
 ```
 .
 ├── docker-compose.yml
 ├── .env.example
 ├── Makefile
-├── README.md
+├── Readme.md
+├── requirements-dev.txt              local venv for tests
 ├── docs/
 │   ├── architecture_decision.md      ← this file
 │   ├── report_notes.md               (Step 10)
 │   └── demo_script.md                (Step 10)
-├── common/                           shared package (installed into every image)
-│   ├── config.py                     env-driven settings
-│   ├── sim_clock.py                  simulated clock
-│   ├── logging.py                    structured JSON logging
-│   ├── schemas.py                    event/lab schemas + validation rules
-│   └── scoring_rules.py              NEWS2-style bands, lab weights, tiers
+├── common/                           pip-installable package `ward_common`
+│   └── ward_common/                  (installed into every image, stdlib-only core)
+│       ├── config.py                 env-driven settings
+│       ├── sim_clock.py              simulated clock + `init|pause|show` CLI
+│       ├── log.py                    structured JSON logging
+│       ├── schemas.py                event/lab schemas + validation rules (Steps 2–4)
+│       └── scoring_rules.py          NEWS2-style bands, lab weights, tiers (Step 4)
+├── kafka/create_topics.sh            topic provisioning (kafka-init service)
+├── scripts/init_env.py               creates .env with generated secrets
 ├── simulators/
 │   ├── vitals_producer/              Kafka producer (Step 2)
 │   └── lab_generator/                daily lab file drop (Step 3)
@@ -356,7 +370,7 @@ consistency argument in code.
 │   ├── Dockerfile
 │   └── app/                          FastAPI routers, DB access, metrics
 ├── db/
-│   └── init/                         SQL schema, views, seed data
+│   └── init/                         00_init.sh (roles, DBs) + sql/NNN_*.sql migrations
 ├── observability/
 │   ├── prometheus/                   prometheus.yml, alert_rules.yml
 │   └── grafana/provisioning/         datasources + dashboard JSON
@@ -385,15 +399,33 @@ container limits (`mem_limit`); typical usage is lower.
 | Kafka (KRaft, 1 broker) | 768 MB | JVM heap 512 MB |
 | PostgreSQL (`ward` + `airflow` DBs) | 512 MB | small `shared_buffers` (128 MB) |
 | Spark (1 container, `local[4]`, 2 queries) | 2 GB | driver memory 1 GB, `spark.sql.shuffle.partitions=6` |
-| Airflow scheduler (LocalExecutor) | 768 MB | `parallelism` 4 |
-| Airflow webserver | 768 MB | 1–2 workers |
+| Airflow scheduler (LocalExecutor, runs tasks) | 1 GB | `parallelism` 4 |
+| Airflow API server (UI + REST + task execution API) | 768 MB | 1 worker |
+| Airflow DAG processor | 512 MB | re-scans DAG folder every 30 s |
 | FastAPI | 256 MB | |
 | Vitals simulator | 256 MB | |
 | Lab simulator | 128 MB | |
 | Prometheus | 256 MB | 2-day retention |
 | Grafana | 256 MB | |
-| **Total limits** | **≈ 6.0 GB** | leaves ~2 GB for the Docker VM and spikes |
+| **Total limits** | **≈ 6.6 GB** | Docker VM reports 7.75 GiB available |
+
+Measured after Step 1 (idle, no data flowing): ≈ 1.1 GB in total (Kafka ≈ 320 MB, Airflow
+≈ 570 MB across three services, everything else < 120 MB each). Limits are ceilings, not
+reservations, so the real headroom is much larger than the table suggests.
 
 Why these choices save memory: Spark runs in **local mode** in one JVM instead of a
 master + worker cluster; Kafka uses **KRaft** (no ZooKeeper JVM); Airflow uses
-**LocalExecutor** (no Redis/Celery workers) and shares the Postgres instance.
+**LocalExecutor** (no Redis/Celery workers), shares the Postgres instance, and skips the
+triggerer (no deferrable operators are used).
+
+### Pinned versions (all arm64-native)
+
+| Component | Image / version |
+|---|---|
+| Kafka | `apache/kafka:4.1.2` (KRaft) |
+| PostgreSQL | `postgres:17.11-alpine` |
+| Spark | `spark:4.1.3-scala2.13-java17-python3-ubuntu` + Kafka connector jars baked in |
+| Airflow | `apache/airflow:3.1.8-python3.12` |
+| FastAPI service | `python:3.12-slim` |
+| Prometheus | `prom/prometheus:v3.5.1` (3.5 LTS line) |
+| Grafana | `grafana/grafana:12.4.0` |
