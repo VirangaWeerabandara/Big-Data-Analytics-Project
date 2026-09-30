@@ -324,7 +324,7 @@ class StreamJob:
     # --- query 4: labs --------------------------------------------------------------
 
     def start_labs(self) -> StreamingQuery:
-        parsed = parse_labs(self._kafka_stream(self.cfg.kafka.topic_labs))
+        parsed = parse_labs(self._kafka_stream(self.cfg.kafka.topic_labs), self._known_patients())
 
         def sink(batch: DataFrame, _batch_id: int) -> None:
             batch = batch.persist()

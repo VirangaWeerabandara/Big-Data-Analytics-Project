@@ -160,7 +160,34 @@ make lab-day d=2026-01-04 f=--force   # (re)deliver a day now, e.g. after a "mis
 curl localhost:8002/metrics        # lab_files_written_total, lab_files_withheld_total, ...
 ```
 
-_Steps 4–7 (streaming job, DAGs, API) will be documented here as they are built._
+### Stream processing (Spark)
+
+One Spark application (`spark` service, local mode) runs five streaming queries:
+
+| Query | Input | Output |
+|---|---|---|
+| `vitals_quality` | `vitals.raw` | validity counts (metrics); invalid records → `deadletter` |
+| `vitals_windows` | `vitals.raw` | 1 h windows + EWS + lab join → `vitals_window_1h`, `patient_live_status`, `alerts` (+ `alerts.patient`) |
+| `vitals_trends` | `vitals.raw` | 4 h/1 h sliding slopes → `vitals_trend_4h`, trend alerts |
+| `labs` | `labs.raw` | `lab_results` (invalid → `deadletter`) |
+| `deadletter_sink` | `deadletter` | `dead_letter` table |
+
+Windows and the watermark are in simulated time (1 h window = 12.5 real s; watermark
+30 sim-min = 6.25 real s). Scoring rules live in `common/ward_common/scoring_rules.py`
+(illustrative NEWS2-style score — not clinical).
+
+```bash
+make stream-status        # row counts of the derived tables
+make logs s=spark         # alert_raised events, query progress
+curl localhost:8003/metrics | grep ^spark_   # lag, batch duration, watermark drops, ...
+make stream-reset         # Kappa replay: wipe derived tables + checkpoints, rebuild from Kafka
+make spark-test           # Spark unit/parity tests (run inside the Spark image)
+```
+
+Changing window sizes, the watermark or `spark.sql.shuffle.partitions` changes the state
+layout, so it needs `make stream-reset`.
+
+_Steps 5–7 (DAGs, API) will be documented here as they are built._
 
 ## Reproducing results
 

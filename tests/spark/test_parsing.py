@@ -80,11 +80,11 @@ def test_lab_validation_matches_python_contract(spark, kafka_rows):
     day = datetime(2026, 1, 3).date()
     rows, _ = inject_bad_rows(LabDayGenerator(ROSTER).rows_for_day(day), day, 42, 0.4)
     events = [lab_event(r, i) for i, r in enumerate(rows, 1)]
-    parsed = parse_labs(kafka_rows([json.dumps(e).encode() for e in events], "labs.raw")).collect()
+    known = spark.createDataFrame([(p,) for p in sorted(KNOWN)], "patient_id string")
+    parsed = parse_labs(kafka_rows([json.dumps(e).encode() for e in events], "labs.raw"), known).collect()
     by_origin = {int(r["origin"].split(":")[-1]): r for r in parsed}
     for i, (source, event) in enumerate(zip(rows, events)):
-        # Unknown patients are only checked by Airflow (it has the roster); ignore that code here.
-        expected = set(validate_lab_row(source, None, day))
+        expected = set(validate_lab_row(source, KNOWN, day))
         assert set(by_origin[i]["error_reasons"]) == expected, source
 
 
@@ -96,7 +96,8 @@ def test_lab_reference_ranges_and_flags(spark, kafka_rows):
         {**base, "test_type": "WBC", "result_value": 3.1, "reference_range": "4.0-11.0"},
         {**base, "test_type": "POTASSIUM", "result_value": 4.2, "reference_range": "3.5-5.3"},
     ]
-    rows = parse_labs(kafka_rows([json.dumps(e).encode() for e in events], "labs.raw")).orderBy("origin").collect()
+    known = spark.createDataFrame([("P001",)], "patient_id string")
+    rows = parse_labs(kafka_rows([json.dumps(e).encode() for e in events], "labs.raw"), known).orderBy("origin").collect()
     assert [(r["ref_low"], r["ref_high"], r["abnormal_flag"]) for r in rows] == [
         (0.0, 5.0, "H"), (4.0, 11.0, "L"), (3.5, 5.3, "N"),
     ]

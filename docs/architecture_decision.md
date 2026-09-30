@@ -129,8 +129,8 @@ flowchart LR
     end
 
     subgraph Spark["Spark Structured Streaming (1 app, local mode)"]
-        Q1["Q1 vitals: parse → validate →<br/>watermark → tumbling + sliding windows →<br/>slope/trend → EWS score →<br/>join latest labs → alerts"]
-        Q2["Q2 labs: parse → validate →<br/>flag abnormal → upsert"]
+        Q1["vitals queries: parse → validate →<br/>dedup + watermark → tumbling + sliding windows →<br/>slope/trend → EWS score →<br/>join labs (48 h) → alerts"]
+        Q2["labs + deadletter queries:<br/>parse → validate → flag abnormal → upsert"]
         CK[("checkpoints/")]
     end
 
@@ -251,13 +251,13 @@ one container's RAM).
 | `sim_clock` | singleton | init step | Shared anchor for simulated time |
 | `patients` | `patient_id` | seed script | Bed, age band, baseline profile, scenario (dimension table) |
 | `vitals_window_1h` | (`patient_id`, `window_start`) | Spark Q1 | Tumbling 1 sim-hour aggregates: count, mean/min/max of each vital, window EWS score |
-| `vitals_trend_4h` | (`patient_id`, `window_start`) | Spark Q1 | Sliding 4 h / 1 h-step windows: per-vital linear slope, `trend_flag` (improving / stable / deteriorating) |
+| `vitals_trend_4h` | (`patient_id`, `window_start`) | Spark Q1 | Sliding 4 h / 1 h-step windows: per-vital linear slope, deterioration/improvement index, `trend` (deteriorating / improving / stable / insufficient_data) |
 | `patient_live_status` | `patient_id` | Spark Q1 | One row per patient: latest vitals, live EWS, lab adjustment, adjusted score, risk tier, `updated_at` — powers the ward API |
 | `alerts` | `alert_id` = hash(patient, type, window_start) | Spark Q1 | Threshold and trend alerts; deterministic ID makes re-writes after a restart idempotent |
-| `lab_results` | (`patient_id`, `test_type`, `collected_at`) | Spark Q2 | Validated lab rows with parsed `ref_low`/`ref_high`, `abnormal_flag`, `source_file` |
+| `lab_results` | (`sample_id`, `test_type`) | Spark Q2 | Validated lab rows with parsed `ref_low`/`ref_high`, `abnormal_flag`, `source_file` (one blood sample → several tests) |
 | `lab_latest` (view) | — | — | `DISTINCT ON (patient_id, test_type)` latest result |
 | `lab_file_loads` | `sim_date` | Airflow | Load audit + data-quality summary (rows total/valid/rejected, checksum, status). Makes batch loads idempotent: a file with the same checksum is not republished |
-| `dead_letter` | (`source`, `kafka_partition`, `kafka_offset`) or (`source_file`, `row_no`) | Spark, Airflow | Queryable copy of rejected records with `error_reason` |
+| `dead_letter` | (`source`, `origin`) — origin is `topic:partition:offset` or `file:row` | Spark (from the `deadletter` topic) | Queryable copy of every rejected record with its `error_reasons`, whichever stage rejected it |
 | `daily_risk_report` | (`report_date`, `patient_id`) | Airflow | Final joined features, base score, lab adjustment, trend adjustment, risk tier |
 | `pipeline_runs` | (`dag_id`, `run_id`, `task_id`) | Airflow callbacks | Task outcome, duration, sim date — source for batch success/failure and duration metrics |
 
@@ -268,21 +268,33 @@ micro-batch retries and Airflow re-runs never duplicate data.
 
 ## 8. Processing logic summary (what makes it more than pass-through)
 
-1. **Validation & cleaning** — schema parse; range checks (e.g. HR 20–250, SpO₂ 50–100,
-   temp 30–45 °C, systolic > diastolic); missing fields; unknown patient → dead-letter with reason.
-2. **Late data** — watermark of 30 sim-min on event time; events older than the watermark are
-   dropped by Spark and counted (`numRowsDroppedByWatermark` → Prometheus).
+1. **Validation & cleaning** — payloads are parsed into Spark 4's `VARIANT` type so JSON types
+   are preserved; checks for missing fields, wrong types, physiological plausibility (e.g. HR
+   20–250, SpO₂ 50–100, temp 30–43 °C), diastolic < systolic, timezone-qualified timestamps and
+   unknown patients (stream-static join with `patients`). Same error codes as the Python contract
+   (parity-tested). Invalid → `deadletter` topic with reasons.
+2. **De-duplication & late data** — `dropDuplicatesWithinWatermark(event_id)` removes duplicate
+   deliveries; a 30 sim-min event-time watermark bounds state, and rows later than it are
+   dropped and counted (`numRowsDroppedByWatermark` → Prometheus).
 3. **Windowed aggregation** — tumbling 1 sim-hour and sliding 4 sim-hour/1 sim-hour windows.
 4. **Trend detection** — least-squares slope per vital inside the sliding window
-   (computed with `covar_pop(value, t) / var_pop(t)`), classified against configurable thresholds.
+   (`try_divide(covar_pop(value, t), var_pop(t))`). Each slope is scaled by the slope noise of
+   stable patients and summed in the worsening direction (deterioration index). Calibrated on
+   the simulator: index ≥ 5 catches ~76 % of worsening 4 h windows at ~1 % false positives in
+   stable patients; single-vital thresholds could not separate slow sepsis from noise.
 5. **Live early-warning score** — NEWS2-style points for HR, SpO₂, systolic BP, temperature
    (respiratory rate, consciousness and O₂ therapy are not in the feed, so the score is partial
    and documented as such).
-6. **Stream/batch join** — each micro-batch is joined with the `lab_latest` snapshot; abnormal
-   lactate, CRP, WBC, creatinine, potassium, haemoglobin or troponin add weighted points.
+6. **Stream/batch join** — each micro-batch of windows is joined (in Spark) with the lab results
+   collected in the 48 h before each window ended, read fresh from Postgres per micro-batch and
+   limited to the batch's time range (so a replay joins historically correct labs). The latest
+   value per test scores against `LAB_RULES` (lactate, CRP, WBC, creatinine, potassium,
+   haemoglobin, troponin), capped at +4.
 7. **Risk tier** — Low / Medium / High from the adjusted score, with a "single red parameter"
    escalation rule.
-8. **Alerts** — threshold breaches (e.g. SpO₂ < 92), high EWS, and sustained deterioration trends.
+8. **Alerts** — threshold breaches needing ≥ 2 readings in the window (a single artefact does
+   not page anyone), HIGH risk tier, and sustained deterioration trends. Deterministic
+   `alert_id`; new alerts are also published to `alerts.patient`.
 9. **Daily report** (Airflow) — joins day D's trends and window scores with labs collected on D,
    producing the consolidated per-patient risk table in HTML + CSV.
 
@@ -296,7 +308,8 @@ consistency argument in code.
 
 | Concern | Mechanism |
 |---|---|
-| Malformed events | Parse with `from_json` + validity column; invalid → `deadletter` topic + `dead_letter` table |
+| Malformed events | `VARIANT` parse + error-code array; invalid → `deadletter` topic → `dead_letter` table |
+| Duplicate events | `dropDuplicatesWithinWatermark(event_id)`; natural-key upserts downstream |
 | Late events | Event-time watermark; dropped-row count exported as a metric |
 | Spark crash / restart | Checkpoints per query on a mounted volume; idempotent upserts give exactly-once *effects* |
 | Duplicate lab file / DAG re-run | `lab_file_loads` checksum check; `lab_results` natural-key upsert |
@@ -359,8 +372,8 @@ consistency argument in code.
 ├── spark/
 │   ├── Dockerfile
 │   └── jobs/
-│       ├── stream_processor.py       app entry point (Q1 + Q2)
-│       └── transforms/               pure functions: validate, window, trend, score, join
+│       ├── stream_processor.py       app entry point (starts the 5 queries)
+│       └── ward_stream/              parsing, windows, scoring, alerts, postgres, metrics, queries
 ├── airflow/
 │   ├── Dockerfile
 │   └── dags/
@@ -398,7 +411,7 @@ container limits (`mem_limit`); typical usage is lower.
 |---|---|---|
 | Kafka (KRaft, 1 broker) | 768 MB | JVM heap 512 MB |
 | PostgreSQL (`ward` + `airflow` DBs) | 512 MB | small `shared_buffers` (128 MB) |
-| Spark (1 container, `local[4]`, 2 queries) | 2 GB | driver memory 1 GB, `spark.sql.shuffle.partitions=6` |
+| Spark (1 container, `local[4]`, 5 queries) | 2 GB | heap 768 MB, RocksDB state capped at 128 MB, `MALLOC_ARENA_MAX=2`; measured ≈ 1.55 GB steady |
 | Airflow scheduler (LocalExecutor, runs tasks) | 1 GB | `parallelism` 4 |
 | Airflow API server (UI + REST + task execution API) | 768 MB | 1 worker |
 | Airflow DAG processor | 512 MB | re-scans DAG folder every 30 s |

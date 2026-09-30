@@ -8,7 +8,7 @@ VENV := .venv
 
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
-        topics offsets consume clock-show clock-pause spark-smoke sim-dry \
+        topics offsets consume clock-show clock-pause sim-dry \
         landing lab-day lab-dry stream-status stream-reset spark-test venv test
 
 help: ## List available targets
@@ -72,9 +72,6 @@ clock-show: ## Print the shared simulated clock
 clock-pause: ## Freeze the simulated clock (resumed by the next `make up`)
 	$(COMPOSE) run --rm --no-deps clock-init python -m ward_common.sim_clock pause
 
-spark-smoke: ## Run the Spark connectivity smoke check
-	$(COMPOSE) run --rm spark
-
 sim-dry: ## Print 5 s of simulated vitals to the terminal (no Kafka, no DB)
 	$(COMPOSE) run --rm --no-deps vitals-simulator python -m ward_sim.vitals_producer --dry-run --duration 5
 
@@ -97,7 +94,7 @@ stream-reset: ## Kappa replay: wipe derived tables + checkpoints, rebuild everyt
 	@read -p "Delete stream checkpoints and derived tables, then replay from Kafka? [y/N] " ans && [ "$$ans" = "y" ]
 	$(COMPOSE) stop spark
 	$(PSQL) -c "TRUNCATE vitals_window_1h, vitals_trend_4h, patient_live_status, alerts, lab_results, dead_letter;"
-	find data/checkpoints -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
+	find data/checkpoints -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
 	$(COMPOSE) start spark
 
 # Mount the working tree so tests run against current source, not what the image was built with.

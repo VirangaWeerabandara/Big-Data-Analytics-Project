@@ -131,7 +131,7 @@ def valid_vitals(parsed: DataFrame) -> DataFrame:
 
 # --- labs ---------------------------------------------------------------------------
 
-def parse_labs(raw: DataFrame) -> DataFrame:
+def parse_labs(raw: DataFrame, known_patients: DataFrame) -> DataFrame:
     """labs.raw rows (published by Airflow after its own DQ check) -> typed rows + error_reasons.
 
     Validated again here on purpose: the stream job must not trust any producer.
@@ -141,8 +141,8 @@ def parse_labs(raw: DataFrame) -> DataFrame:
     errors: list[Column] = [_code(~present(f), f"missing:{f}") for f in LAB_EVENT_FIELDS]
 
     pid = _vget("patient_id", "string")
-    errors.append(_code(present("patient_id") & ~(_is_string("patient_id") & pid.rlike(PATIENT_ID_REGEX)),
-                        "bad_patient_id"))
+    pid_ok = _is_string("patient_id") & pid.rlike(PATIENT_ID_REGEX)
+    errors.append(_code(present("patient_id") & ~pid_ok, "bad_patient_id"))
 
     test = F.upper(F.trim(_vget("test_type", "string")))
     errors.append(_code(present("test_type") & ~test.isin(*LAB_TESTS), "unknown_test"))
@@ -170,6 +170,10 @@ def parse_labs(raw: DataFrame) -> DataFrame:
     file_day = F.try_to_date(_vget("file_day", "string"))
     errors.append(_code(collected.isNotNull() & file_day.isNotNull() & (F.to_date(collected) != file_day),
                         "collected_outside_file_day"))
+
+    known = known_patients.select(F.col("patient_id").alias("_known_id"))
+    df = df.join(F.broadcast(known), pid == known._known_id, "left")
+    errors.append(_code(pid_ok & F.col("_known_id").isNull(), "unknown_patient"))
 
     return df.select(
         "raw_payload",
