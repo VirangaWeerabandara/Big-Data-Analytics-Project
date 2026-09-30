@@ -2,7 +2,7 @@
 
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Status   | Proposed (awaiting confirmation)                   |
+| Status   | Accepted                                           |
 | Date     | 2026-09-30                                         |
 | Decision | **Kappa architecture** (single streaming path, Kafka as the replayable source of truth) |
 | Rejected | Lambda architecture (separate batch + speed layers) |
@@ -95,8 +95,10 @@ configured to cover the full simulated history.
 
 ### Honest trade-offs we accept
 
-- **Replay time grows with history.** Mitigation: bounded retention on vitals; the Parquet
-  archive (optional) exists for long-term audit, not as a batch layer.
+- **Replay time grows with history, and history is bounded by retention.** Mitigation: vitals
+  retention (7 real days ≈ 2,000 sim days) far exceeds any demo run. Long-term raw archival
+  (e.g. Kafka → Parquet/object storage) is deliberately out of scope for the laptop build and
+  listed as a production improvement.
 - **Kafka becomes critical state.** Mitigation: single broker is acceptable for a laptop demo;
   production would use RF=3, `min.insync.replicas=2` (documented in report notes).
 - **Stream–table join semantics.** Labs are joined per micro-batch against the latest lab
@@ -134,7 +136,6 @@ flowchart LR
 
     subgraph Storage
         PG[("PostgreSQL<br/>db: ward")]
-        PQ[("Parquet archive<br/>raw valid vitals<br/>(optional)")]
     end
 
     API["FastAPI<br/>/ward/summary · /patients/{id}<br/>/alerts · /reports/latest<br/>/health · /metrics"]
@@ -143,7 +144,6 @@ flowchart LR
     subgraph Obs["Observability"]
         PR["Prometheus<br/>+ alert rules"]
         GR["Grafana<br/>provisioned dashboard"]
-        PGW["Pushgateway<br/>(batch task metrics)"]
     end
 
     VS -->|produce| T1
@@ -155,7 +155,6 @@ flowchart LR
     Q1 -->|invalid / too late| T4
     Q1 -->|foreachBatch upsert| PG
     Q1 --> T3
-    Q1 -.-> PQ
     Q2 -->|foreachBatch upsert| PG
     Q1 --- CK
     Q2 --- CK
@@ -165,10 +164,9 @@ flowchart LR
 
     VS -. /metrics .-> PR
     Q1 -. /metrics .-> PR
-    API -. /metrics .-> PR
-    D1 -. push .-> PGW
-    D2 -. push .-> PGW
-    PGW --> PR
+    API -. "/metrics (incl. batch/DQ<br/>gauges read from PG)" .-> PR
+    D1 -. "lab_file_loads,<br/>pipeline_runs" .-> PG
+    D2 -. pipeline_runs .-> PG
     PR --> GR
     PG -. SQL datasource .-> GR
 ```
@@ -234,8 +232,8 @@ hurting latency), JSON values with a `schema_version` field.
 **Why plain PostgreSQL, not TimescaleDB:** Spark already performs the time-bucketing and
 windowed aggregation, so Postgres stores *pre-aggregated* rows (≈ 20 patients × 24 windows per
 sim day), not raw high-frequency readings. Timescale's hypertables and continuous aggregates
-would duplicate work Spark already does. Raw validated vitals go to the optional Parquet archive
-instead. A second database `airflow` in the same Postgres instance holds Airflow metadata (saves
+would duplicate work Spark already does. Raw readings stay in Kafka (the Kappa log) for replay
+rather than being copied into Postgres. A second database `airflow` in the same Postgres instance holds Airflow metadata (saves
 one container's RAM).
 
 | Table | Primary / unique key | Written by | Purpose |
@@ -251,6 +249,7 @@ one container's RAM).
 | `lab_file_loads` | `sim_date` | Airflow | Load audit + data-quality summary (rows total/valid/rejected, checksum, status). Makes batch loads idempotent: a file with the same checksum is not republished |
 | `dead_letter` | (`source`, `kafka_partition`, `kafka_offset`) or (`source_file`, `row_no`) | Spark, Airflow | Queryable copy of rejected records with `error_reason` |
 | `daily_risk_report` | (`report_date`, `patient_id`) | Airflow | Final joined features, base score, lab adjustment, trend adjustment, risk tier |
+| `pipeline_runs` | (`dag_id`, `run_id`, `task_id`) | Airflow callbacks | Task outcome, duration, sim date — source for batch success/failure and duration metrics |
 
 All writes are **upserts** (`INSERT … ON CONFLICT … DO UPDATE`) keyed on natural keys, so Spark
 micro-batch retries and Airflow re-runs never duplicate data.
@@ -298,8 +297,14 @@ consistency argument in code.
 
 ## 10. Observability plan (detail in Step 8)
 
-- **Ingestion:** events produced / failed per topic (simulator `/metrics`), lab file DQ results
-  (Pushgateway).
+- **Ingestion:** events produced / failed per topic (simulator `/metrics`); lab file DQ results
+  recorded in `lab_file_loads`.
+- **Batch metrics without a Pushgateway:** Airflow tasks are short-lived, so they cannot be
+  scraped directly. Instead they record outcomes in Postgres (`lab_file_loads`,
+  `pipeline_runs` via success/failure callbacks), and the FastAPI `/metrics` endpoint exposes
+  them as gauges (e.g. `lab_last_successful_load_timestamp`, `dag_task_failures_total`). This
+  adds no extra container. Trade-off: if the API is down these gauges disappear, which is itself
+  caught by an `up == 0` alert on the API target.
 - **Processing:** input rate, processing rate, batch duration, rows dropped by watermark,
   invalid-record count, and **consumer lag computed from Spark progress** (Spark tracks its own
   offsets in checkpoints and does not commit to a Kafka consumer group, so a standard
@@ -309,6 +314,9 @@ consistency argument in code.
   - `VitalsNotReceived` — no vitals consumed for N real minutes (default 2).
   - `HighInvalidRecordRate` — invalid / total > 5 % over 5 real minutes.
   - `LabFileLate` — no successful lab load for > 1.5 × `SIM_DAY_SECONDS`.
+- **No Alertmanager:** rules are evaluated by Prometheus and are visible as
+  pending/firing on its `/alerts` page and on the Grafana dashboard. Routing to email/pager
+  (Alertmanager) is a production improvement, not needed to demonstrate detection.
 - Structured JSON logs from every Python component via one shared logger.
 
 ---
@@ -353,16 +361,39 @@ consistency argument in code.
 │   ├── prometheus/                   prometheus.yml, alert_rules.yml
 │   └── grafana/provisioning/         datasources + dashboard JSON
 ├── data/                             (git-ignored contents)
-│   ├── landing/  archive/  quarantine/  parquet/  checkpoints/
+│   ├── landing/  archive/  quarantine/  checkpoints/
 ├── reports/                          generated daily reports (git-ignored)
 └── tests/
 ```
 
 ---
 
-## 12. Open points to confirm before Step 1
+## 12. Confirmed decisions
 
-1. Kappa as described (labs published into Kafka by Airflow) — confirm.
-2. Plain PostgreSQL (TimescaleDB rejected, reasoning in §7) — confirm.
-3. Laptop RAM / CPU, to size the Docker Compose memory limits.
-4. Optional components: Parquet archive, Pushgateway, Alertmanager — include or skip.
+1. Kappa, with Airflow publishing validated lab rows into Kafka.
+2. Plain PostgreSQL (TimescaleDB rejected, reasoning in §7).
+3. Optional components **not** included: Parquet archive, Pushgateway, Alertmanager.
+
+## 13. Resource budget
+
+Target machine: MacBook Pro (Apple M5, arm64), 16 GB RAM, **8 GB allocated to Docker**.
+All images must be multi-arch (arm64-native) to avoid slow emulation. Memory values are
+container limits (`mem_limit`); typical usage is lower.
+
+| Service | Limit | Tuning |
+|---|---|---|
+| Kafka (KRaft, 1 broker) | 768 MB | JVM heap 512 MB |
+| PostgreSQL (`ward` + `airflow` DBs) | 512 MB | small `shared_buffers` (128 MB) |
+| Spark (1 container, `local[4]`, 2 queries) | 2 GB | driver memory 1 GB, `spark.sql.shuffle.partitions=6` |
+| Airflow scheduler (LocalExecutor) | 768 MB | `parallelism` 4 |
+| Airflow webserver | 768 MB | 1–2 workers |
+| FastAPI | 256 MB | |
+| Vitals simulator | 256 MB | |
+| Lab simulator | 128 MB | |
+| Prometheus | 256 MB | 2-day retention |
+| Grafana | 256 MB | |
+| **Total limits** | **≈ 6.0 GB** | leaves ~2 GB for the Docker VM and spikes |
+
+Why these choices save memory: Spark runs in **local mode** in one JVM instead of a
+master + worker cluster; Kafka uses **KRaft** (no ZooKeeper JVM); Airflow uses
+**LocalExecutor** (no Redis/Celery workers) and shares the Postgres instance.

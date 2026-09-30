@@ -19,7 +19,6 @@ venv/
 data/landing/*
 data/archive/*
 data/quarantine/*
-data/parquet/*
 data/checkpoints/*
 !data/**/.gitkeep
 reports/*
