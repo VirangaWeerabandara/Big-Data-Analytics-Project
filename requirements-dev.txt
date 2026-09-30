@@ -1,0 +1,3 @@
+# Local development and tests (make venv && make test).
+-e ./common[db]
+pytest==9.1.1
