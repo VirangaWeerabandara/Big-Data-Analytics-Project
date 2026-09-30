@@ -156,6 +156,36 @@ services:
       kafka:
         condition: service_healthy
 
+  vitals-simulator:
+    build:
+      context: .
+      dockerfile: simulators/Dockerfile
+    image: ward-vitals/simulators:local
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *default-logging
+    command: ["python", "-m", "ward_sim.vitals_producer"]
+    environment:
+      <<: [*ward-db-env, *clock-env, *kafka-env]
+      SIM_PATIENTS: ${SIM_PATIENTS:-20}
+      SIM_RATE: ${SIM_RATE:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_DETERIORATING_FRACTION: ${SIM_DETERIORATING_FRACTION:-0.5}
+      SIM_SPIKE_RATE: ${SIM_SPIKE_RATE:-0.01}
+      SIM_MALFORMED_RATE: ${SIM_MALFORMED_RATE:-0.02}
+      SIM_LATE_RATE: ${SIM_LATE_RATE:-0.02}
+      SIM_DUPLICATE_RATE: ${SIM_DUPLICATE_RATE:-0.01}
+      SIM_LATE_MIN_MINUTES: ${SIM_LATE_MIN_MINUTES:-5}
+      SIM_LATE_MAX_MINUTES: ${SIM_LATE_MAX_MINUTES:-120}
+      SIM_METRICS_PORT: "8001"
+    ports:
+      - "127.0.0.1:${VITALS_METRICS_HOST_PORT:-8001}:8001"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      clock-init:
+        condition: service_completed_successfully
+
   # --------------------------------------------------------------- processing
   spark:
     build:

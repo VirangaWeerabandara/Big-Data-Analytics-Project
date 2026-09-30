@@ -75,7 +75,46 @@ Inspect it with `make clock-show`, or in SQL with `SELECT sim_now();`.
 
 ## Running the pipeline
 
-_To be completed in Steps 2–7 (simulators, streaming job, DAGs, API)._
+### Vitals simulator (streaming source)
+
+Starts automatically with `make up` as the `vitals-simulator` service and publishes JSON
+readings to `vitals.raw`, keyed by `patient_id`.
+
+```json
+{"schema_version":1,"event_id":"46fe7133-…","patient_id":"P009","heart_rate":65,"spo2":98,
+ "systolic_bp":97,"diastolic_bp":65,"temperature":36.5,
+ "timestamp":"2026-01-04T07:01:41.695Z","produced_at":"2026-09-30T12:03:54.120Z"}
+```
+
+`timestamp` is simulated event time (used for windows); `produced_at` is real time (used only
+for latency). Each patient follows a hidden storyline — `stable`, `sepsis`,
+`respiratory_failure`, `haemorrhage` or `recovering` — with gradual, recurring deterioration
+episodes, plus random short spikes. The storyline is stored in the `patients` table as ground
+truth for evaluation and is never sent in the stream.
+
+Configuration (`.env` or CLI flags):
+
+| Variable | Flag | Default | Meaning |
+|---|---|---|---|
+| `SIM_PATIENTS` | `--patients` | 20 | Patients on the ward |
+| `SIM_RATE` | `--rate` | 20 | Total readings per real second |
+| `SIM_SEED` | `--seed` | 42 | Same seed → same patients and storylines |
+| `SIM_SPIKE_RATE` | `--spike-rate` | 0.01 | Chance a transient spike starts per reading |
+| `SIM_MALFORMED_RATE` | `--malformed-rate` | 0.02 | Broken payloads (→ dead-letter) |
+| `SIM_LATE_RATE` | `--late-rate` | 0.02 | Readings delivered 5–120 sim-minutes late |
+| `SIM_DUPLICATE_RATE` | `--duplicate-rate` | 0.01 | Readings sent twice with the same `event_id` |
+
+Useful commands:
+
+```bash
+make sim-dry                  # print 5 s of readings, no Kafka/DB needed
+make consume n=5              # newest messages on vitals.raw
+make offsets                  # messages per partition
+make logs s=vitals-simulator  # includes deterioration_started / _resolved events
+curl localhost:8001/metrics   # producer metrics
+```
+
+_Steps 3–7 (lab files, streaming job, DAGs, API) will be documented here as they are built._
 
 ## Reproducing results
 

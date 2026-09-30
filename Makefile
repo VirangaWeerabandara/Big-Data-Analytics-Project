@@ -1,11 +1,14 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 PSQL := $(COMPOSE) exec -T postgres psql -U ward -d ward
+# Kafka CLI tools start a JVM inside the broker container; cap its heap so they
+# cannot push the broker over its memory limit.
+KAFKA_CLI := $(COMPOSE) exec -e KAFKA_HEAP_OPTS=-Xmx128m kafka /opt/kafka/bin
 VENV := .venv
 
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
-        topics clock-show clock-pause spark-smoke venv test
+        topics offsets consume clock-show clock-pause spark-smoke sim-dry venv test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -52,7 +55,15 @@ psql: ## Open a psql shell on the ward database
 	$(COMPOSE) exec postgres psql -U ward -d ward
 
 topics: ## Describe Kafka topics
-	$(COMPOSE) exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+	$(KAFKA_CLI)/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+
+offsets: ## Latest offset per partition (optionally: make offsets t=vitals.raw)
+	$(KAFKA_CLI)/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic $(or $(t),vitals.raw)
+
+consume: ## Print the newest messages (optionally: make consume t=deadletter n=10)
+	$(KAFKA_CLI)/kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+		--topic $(or $(t),vitals.raw) --max-messages $(or $(n),5) \
+		--property print.key=true --property print.partition=true
 
 clock-show: ## Print the shared simulated clock
 	$(COMPOSE) run --rm --no-deps clock-init python -m ward_common.sim_clock show
@@ -62,6 +73,9 @@ clock-pause: ## Freeze the simulated clock (resumed by the next `make up`)
 
 spark-smoke: ## Run the Spark connectivity smoke check
 	$(COMPOSE) run --rm spark
+
+sim-dry: ## Print 5 s of simulated vitals to the terminal (no Kafka, no DB)
+	$(COMPOSE) run --rm --no-deps vitals-simulator python -m ward_sim.vitals_producer --dry-run --duration 5
 
 # ----------------------------------------------------------------- tests
 venv: ## Create a local virtualenv for tests

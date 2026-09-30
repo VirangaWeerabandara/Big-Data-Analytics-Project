@@ -1,3 +1,4 @@
 # Local development and tests (make venv && make test).
 -e ./common[db]
+prometheus-client==0.26.0
 pytest==9.1.1
