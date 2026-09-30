@@ -9,7 +9,7 @@ VENV := .venv
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
         topics offsets consume clock-show clock-pause sim-dry \
-        landing lab-day lab-dry stream-status stream-reset spark-test venv test
+        landing lab-day lab-dry stream-status stream-reset spark-test dag-trigger lab-loads venv test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -85,6 +85,13 @@ lab-day: ## Drop the lab file for one simulated day now (make lab-day d=2026-01-
 lab-dry: ## Print the lab CSV for one simulated day (make lab-dry d=2026-01-05)
 	@test -n "$(d)" || { echo "usage: make lab-dry d=YYYY-MM-DD"; exit 1; }
 	@$(COMPOSE) run --rm --no-deps lab-simulator python -m ward_sim.lab_generator --day $(d) --dry-run
+
+# ---------------------------------------------------------------- airflow
+dag-trigger: ## Trigger a DAG run now (make dag-trigger d=lab_ingest)
+	$(COMPOSE) exec airflow-scheduler airflow dags trigger $(or $(d),lab_ingest)
+
+lab-loads: ## Lab file ledger: arrival, DQ counts, idempotency counters per day
+	@$(PSQL) -c "SELECT file_day, status, arrival, rows_total AS total, rows_valid AS valid, rows_rejected AS rejected, reject_reasons, deliveries, duplicate_deliveries AS dup FROM lab_file_loads ORDER BY file_day;"
 
 # -------------------------------------------------------- stream processing
 stream-status: ## Row counts of the tables the stream job maintains

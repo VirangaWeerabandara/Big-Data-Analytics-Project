@@ -187,7 +187,35 @@ make spark-test           # Spark unit/parity tests (run inside the Spark image)
 Changing window sizes, the watermark or `spark.sql.shuffle.partitions` changes the state
 layout, so it needs `make stream-reset`.
 
-_Steps 5–7 (DAGs, API) will be documented here as they are built._
+### Lab ingestion (Airflow)
+
+DAG `lab_ingest` (Airflow UI → http://localhost:8080) runs once per simulated day:
+
+1. `resolve_target_day` — yesterday in simulated time.
+2. `wait_for_lab_file` — sensor (reschedule mode). If the file is not in `landing/` by
+   06:00 + `LAB_SLA_HOURS` (simulated), the day is recorded as **missing** and the task fails.
+3. `load_landing_files` — runs regardless and processes every waiting file: sha256 checksum,
+   header check, row validation (shared validator + in-file duplicates), then either publishes
+   valid rows to `labs.raw` and rejected rows to `deadletter`, or quarantines the whole file
+   (> `LAB_MAX_REJECT_RATE` bad rows). Files end up in `data/archive/` or `data/quarantine/`.
+
+Nothing in Airflow writes lab results to Postgres: Spark consumes `labs.raw` (Kappa).
+
+```bash
+make lab-loads                                   # per-day ledger: status, arrival, DQ counts
+make dag-trigger d=lab_ingest                    # run now instead of waiting
+make lab-day d=2026-01-10 f=--force              # identical re-delivery -> skipped as duplicate
+make lab-day d=2026-01-02 f="--bad-row-rate 0.6" # mostly-bad file -> quarantined
+docker compose stop lab-simulator                # -> next day recorded as missing
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LAB_SLA_HOURS` | 4 | Simulated hours after the 06:00 upload before a file counts as missing |
+| `LAB_MAX_REJECT_RATE` | 0.2 | Quarantine the file above this fraction of bad rows |
+| `LAB_POKE_SECONDS` | 10 | Sensor poke interval (real seconds) |
+
+_Steps 6–7 (risk report, API) will be documented here as they are built._
 
 ## Reproducing results
 

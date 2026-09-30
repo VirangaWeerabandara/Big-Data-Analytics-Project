@@ -117,7 +117,7 @@ flowchart LR
     end
 
     subgraph Airflow["Apache Airflow"]
-        D1["lab_ingest DAG<br/>FileSensor → validate (DQ)<br/>→ publish to Kafka → archive"]
+        D1["lab_ingest DAG<br/>sim-clock sensor → validate (DQ)<br/>→ publish to Kafka → archive/quarantine"]
         D2["daily_risk_report DAG<br/>wait for labs loaded →<br/>join trends + labs →<br/>HTML/CSV report"]
     end
 
@@ -256,10 +256,10 @@ one container's RAM).
 | `alerts` | `alert_id` = hash(patient, type, window_start) | Spark Q1 | Threshold and trend alerts; deterministic ID makes re-writes after a restart idempotent |
 | `lab_results` | (`sample_id`, `test_type`) | Spark Q2 | Validated lab rows with parsed `ref_low`/`ref_high`, `abnormal_flag`, `source_file` (one blood sample → several tests) |
 | `lab_latest` (view) | — | — | `DISTINCT ON (patient_id, test_type)` latest result |
-| `lab_file_loads` | `sim_date` | Airflow | Load audit + data-quality summary (rows total/valid/rejected, checksum, status). Makes batch loads idempotent: a file with the same checksum is not republished |
+| `lab_file_loads` | `file_day` | Airflow | Ledger per simulated day: status (loaded / quarantined / missing), arrival (on_time / late / missing), sha256 checksum, rows total/valid/rejected, reject reasons (jsonb), deliveries and duplicate-delivery counters. An identical re-delivery is recognised by checksum and not republished |
 | `dead_letter` | (`source`, `origin`) — origin is `topic:partition:offset` or `file:row` | Spark (from the `deadletter` topic) | Queryable copy of every rejected record with its `error_reasons`, whichever stage rejected it |
 | `daily_risk_report` | (`report_date`, `patient_id`) | Airflow | Final joined features, base score, lab adjustment, trend adjustment, risk tier |
-| `pipeline_runs` | (`dag_id`, `run_id`, `task_id`) | Airflow callbacks | Task outcome, duration, sim date — source for batch success/failure and duration metrics |
+| `pipeline_runs` | (`dag_id`, `run_id`, `task_id`, `try_number`) | Airflow task callbacks | Task outcome, duration and error — source for batch success/failure and duration metrics |
 
 All writes are **upserts** (`INSERT … ON CONFLICT … DO UPDATE`) keyed on natural keys, so Spark
 micro-batch retries and Airflow re-runs never duplicate data.
@@ -312,9 +312,9 @@ consistency argument in code.
 | Duplicate events | `dropDuplicatesWithinWatermark(event_id)`; natural-key upserts downstream |
 | Late events | Event-time watermark; dropped-row count exported as a metric |
 | Spark crash / restart | Checkpoints per query on a mounted volume; idempotent upserts give exactly-once *effects* |
-| Duplicate lab file / DAG re-run | `lab_file_loads` checksum check; `lab_results` natural-key upsert |
-| Bad lab rows | Row-level DQ in Airflow; bad rows to dead-letter, file still loads if reject rate < threshold, otherwise quarantined |
-| Missing/late lab file | FileSensor timeout + Prometheus rule on "time since last successful lab load" |
+| Duplicate lab file / DAG re-run | sha256 checksum in `lab_file_loads` (identical file skipped); republishing is harmless anyway: `lab_results` upserts on (`sample_id`, `test_type`), `dead_letter` on (`source`, `origin`) |
+| Bad lab rows | Row-level DQ in Airflow with the shared validator (+ in-file duplicate check); bad rows to the dead-letter topic; whole file quarantined if > 20 % of rows fail or the header is wrong; a bad re-delivery never overrides a day that already loaded |
+| Missing/late lab file | Sensor with a *simulated-time* deadline (upload hour + 4 h SLA) records the day as `missing` and fails without retries; the next run still loads whatever is waiting, so a late file flips the day to `loaded` / `late`. Prometheus rule in Step 8 |
 
 ---
 
