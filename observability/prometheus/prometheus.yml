@@ -1,8 +1,10 @@
-# Scrape targets grow step by step (simulators in Step 2, Spark in Step 4).
-# Alert rules are added in Step 8.
+# One scrape job per pipeline stage. Alert rules: alert_rules.yml.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+
+rule_files:
+  - alert_rules.yml
 
 scrape_configs:
   - job_name: prometheus

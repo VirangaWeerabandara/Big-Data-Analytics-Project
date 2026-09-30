@@ -33,12 +33,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from airflow.exceptions import AirflowFailException
-from airflow.sdk import Asset, PokeReturnValue, TriggerRule, dag, get_current_context, task
+from airflow.sdk import PokeReturnValue, TriggerRule, dag, get_current_context, task
 
 from ward_common.config import KafkaSettings
 from ward_common.log import configure_logging
 from ward_common.schemas import lab_file_name
 from ward_ingest import audit
+from ward_ingest.assets import LABS_PUBLISHED
 from ward_ingest.callbacks import on_failure, on_success
 from ward_ingest.kafka_publish import publish
 from ward_ingest.lab_files import check_file, classify_arrival, deadletter_event, decide, expected_upload, lab_event
@@ -51,9 +52,6 @@ MAX_REJECT_RATE = float(os.environ.get("LAB_MAX_REJECT_RATE", "0.2"))
 POKE_SECONDS = float(os.environ.get("LAB_POKE_SECONDS", "10"))
 
 LANDING, ARCHIVE, QUARANTINE = DATA_DIR / "landing", DATA_DIR / "archive", DATA_DIR / "quarantine"
-
-# Downstream DAGs (Step 6) can be scheduled on this asset.
-LABS_PUBLISHED = Asset("kafka://kafka:9092/labs.raw")
 
 log = logging.getLogger("ward_ingest.lab_ingest")
 

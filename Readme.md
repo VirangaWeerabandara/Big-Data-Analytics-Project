@@ -18,14 +18,28 @@ Grafana observe every stage.
 Full decision record, diagram, topic and table design:
 [docs/architecture_decision.md](docs/architecture_decision.md).
 
-| Layer | Technology |
-|---|---|
-| Ingestion | Apache Kafka 4.1 (KRaft, single broker) |
-| Stream processing | Apache Spark 4.1 Structured Streaming (local mode) |
-| Orchestration | Apache Airflow 3.1 (LocalExecutor) |
-| Storage | PostgreSQL 17 |
-| Serving | FastAPI |
-| Observability | Structured JSON logs, Prometheus, Grafana |
+```mermaid
+flowchart LR
+    VS[Vitals simulator] -->|vitals.raw| K[(Kafka)]
+    LS[Lab simulator] -->|daily CSV| AF[Airflow lab_ingest]
+    AF -->|labs.raw / deadletter| K
+    K --> SP[Spark: 5 streaming queries]
+    SP -->|upserts| PG[(PostgreSQL)]
+    SP -->|alerts.patient / deadletter| K
+    PG --> RP[Airflow daily_risk_report] --> R[reports/*.html,csv]
+    PG --> API[FastAPI]
+    R --> API
+    VS & SP & API -. metrics .-> PR[Prometheus + rules] --> GR[Grafana]
+```
+
+| Layer | Technology | Why it fits *this* ward |
+|---|---|---|
+| Ingestion | Apache Kafka 4.1 (KRaft, single broker) | Durable, replayable log = the Kappa source of truth; keying by `patient_id` keeps each patient's readings ordered for trend detection; KRaft drops the ZooKeeper JVM on a laptop |
+| Stream processing | Apache Spark 4.1 Structured Streaming (local mode) | Event-time windows, watermarks, de-duplication and checkpointed exactly-once *effects* out of the box; `VARIANT` parsing for strict validation; one JVM in local mode |
+| Orchestration | Apache Airflow 3.1 (LocalExecutor) | The lab feed is a daily file with an SLA: sensors, retries, callbacks and asset-triggered chaining are exactly Airflow's job; LocalExecutor avoids Redis/Celery |
+| Storage | PostgreSQL 17 | Spark stores small pre-aggregated rows, so upserts on natural keys (idempotency) matter more than time-series compression; TimescaleDB rejected (see ADR §7) |
+| Serving | FastAPI | Typed, validated, self-documenting endpoints (`/docs`) with dependency injection that makes the API testable without a database |
+| Observability | JSON logs, Prometheus, Grafana | Pull-based metrics from every stage, rule-based alerts with unit tests (`promtool`), a dashboard provisioned as code |
 
 ## Prerequisites
 
@@ -168,7 +182,7 @@ One Spark application (`spark` service, local mode) runs five streaming queries:
 |---|---|---|
 | `vitals_quality` | `vitals.raw` | validity counts (metrics); invalid records → `deadletter` |
 | `vitals_windows` | `vitals.raw` | 1 h windows + EWS + lab join → `vitals_window_1h`, `patient_live_status`, `alerts` (+ `alerts.patient`) |
-| `vitals_trends` | `vitals.raw` | 4 h/1 h sliding slopes → `vitals_trend_4h`, trend alerts |
+| `vitals_trends` | `vitals.raw` | 4 h/1 h sliding slopes (append mode: each window once, complete) → `vitals_trend_4h`, trend alerts |
 | `labs` | `labs.raw` | `lab_results` (invalid → `deadletter`) |
 | `deadletter_sink` | `deadletter` | `dead_letter` table |
 
@@ -215,27 +229,143 @@ docker compose stop lab-simulator                # -> next day recorded as missi
 | `LAB_MAX_REJECT_RATE` | 0.2 | Quarantine the file above this fraction of bad rows |
 | `LAB_POKE_SECONDS` | 10 | Sensor poke interval (real seconds) |
 
-_Steps 6–7 (risk report, API) will be documented here as they are built._
+### Daily risk report (Airflow)
+
+DAG `daily_risk_report` is triggered by the lab asset every time `lab_ingest` finishes. For
+simulated day D it waits (briefly) for Spark to load D's labs, then joins in SQL + Python:
+
+- **vitals**: end-of-day EWS from the reading-weighted averages of D's last 4 hours, peak EWS,
+  hours at HIGH/MEDIUM, extremes;
+- **trends**: last trend of the day and number of deteriorating 4 h windows;
+- **alerts** raised during D by severity;
+- **labs**: latest result per test collected in the 48 h up to the end of D.
+
+Each patient gets a *vitals-only* tier and a tier *with labs*; the report highlights patients
+whose tier the labs raised — the business question. Output: `daily_risk_report` table and
+`reports/risk_report_<D>.html` / `.csv` (also served by the API). Same scoring rules as the
+stream job (`scoring_rules.py`).
+
+### Serving API (FastAPI)
+
+Interactive docs at http://localhost:8000/docs.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /ward/summary` | Live tiers, active alerts by severity, ward averages, data freshness, latest lab file and report |
+| `GET /patients?tier=` | All patients with their live score, highest risk first |
+| `GET /patients/{id}` | Live status, latest labs (flagged if they count toward the score), active alert count |
+| `GET /patients/{id}/vitals?hours=` | 1 h window aggregates and scores |
+| `GET /patients/{id}/trends?hours=` | 4 h slopes, deterioration index, trend |
+| `GET /alerts?severity=&patient_id=&hours=&include_acknowledged=` | Alerts, most severe first |
+| `POST /alerts/{id}/acknowledge` | Acknowledge an alert |
+| `GET /reports/latest`, `GET /reports/{date}` | Daily consolidated risk report |
+| `GET /reports/{date}/html` \| `/csv` | Rendered report files |
+| `GET /health` | Liveness + Postgres and sim-clock checks (503 when degraded) |
+| `GET /metrics` | Prometheus: HTTP metrics + pipeline/batch/storage state read at scrape time |
+
+### Observability
+
+- **Logs**: every Python component writes one JSON object per line (`service`, `event`,
+  fields) — `make logs s=<service> | jq`.
+- **Metrics** (Prometheus, http://localhost:9090/targets): vitals simulator (`:8001`), lab
+  simulator (`:8002`), Spark driver (`:8003` — per-query rates, Kafka lag, batch duration,
+  watermark drops, invalid records, end-to-end latency) and the API (`:8000` — HTTP metrics,
+  lab ledger, Airflow task outcomes, table sizes, live tiers).
+- **Alert rules** (`observability/prometheus/alert_rules.yml`, 15 rules, unit-tested with
+  `promtool`), including the three required ones:
+
+  | Alert | Fires when |
+  |---|---|
+  | `VitalsNotReceived` | no vitals micro-batch processed for 2 real minutes |
+  | `HighInvalidRecordRate` | > 5 % of vitals dead-lettered over 5 minutes |
+  | `LabFileMissing` / `LabFileLate` | yesterday's file not received by 06:00 + 4 h (sim) / > 2 h late |
+
+- **Dashboard**: Grafana → *Ward Monitoring → Ward vitals pipeline* (provisioned; generated by
+  `observability/grafana/build_dashboard.py`, `make dashboard`): KPI row, ingestion,
+  processing, batch, storage & serving, live ward tables from Postgres, firing alerts.
+- **Health checks**: every long-running container has a Docker health check (`make ps`).
 
 ## Reproducing results
 
-_To be completed in Step 10._
+From a clean checkout (≈ 10 minutes of real time = 2 simulated days of data):
+
+```bash
+make env && make venv && make up        # everything healthy after ~2 min (make ps)
+make test-all                           # 154 local + 15 Spark + 6 Airflow tests, promtool rules
+make stream-status                      # derived tables filling
+make lab-loads                          # a ledger row per simulated day
+curl -s localhost:8000/ward/summary | jq
+curl -s localhost:8000/reports/latest | jq '.tiers, .escalated_by_labs'
+open http://localhost:3000              # dashboard
+```
+
+Robustness experiments (each is reversible):
+
+| Experiment | Command | Expected |
+|---|---|---|
+| Kappa replay | `echo y \| make stream-reset` | all derived tables rebuilt from Kafka; lag back to 0 in < 1 min |
+| Restart from checkpoint | `docker compose restart spark` | no duplicate alerts, no reprocessing |
+| Bad data burst | `SIM_MALFORMED_RATE=0.15 docker compose up -d vitals-simulator` | `HighInvalidRecordRate` fires in ~2.5 min |
+| Source outage | `docker compose stop vitals-simulator` | `VitalsProducerSilent`, then `VitalsNotReceived` (~3 min) |
+| Missing lab file | `docker compose stop lab-simulator` | `LabFileLate` → `LabFileMissing`; day recorded `missing`; restart → `loaded/late` |
+| Duplicate lab file | `make lab-day d=<loaded day> f=--force` | skipped by checksum (`duplicate_deliveries` + 1) |
+| Mostly-bad lab file | `make lab-day d=<day> f="--bad-row-rate 0.6"` | quarantined, nothing published |
+
+Restore with `docker compose up -d vitals-simulator lab-simulator`. Measured results are in
+[docs/report_notes.md](docs/report_notes.md); a timed walkthrough is in
+[docs/demo_script.md](docs/demo_script.md).
 
 ## Tests
 
 ```bash
-make venv     # once
-make test
+make venv       # once
+make test       # local: simulators, contracts, scoring rules, ingestion DQ, report, API, dashboard
+make spark-test # Spark parsing/scoring parity, windows, alerts (inside the Spark image)
+make airflow-test  # DAG integrity (inside the Airflow image)
+make test-alerts   # promtool: Prometheus config + alert-rule unit tests
+make test-all      # all of the above
 ```
 
 ## Repository layout
 
-See [docs/architecture_decision.md §11](docs/architecture_decision.md#11-repository-layout).
+```
+common/ward_common/     shared package: config, sim clock, JSON logging, event contracts, scoring rules
+simulators/ward_sim/    vitals producer and lab file generator
+spark/jobs/             streaming job (ward_stream/: parsing, windows, scoring, alerts, sinks, metrics)
+airflow/dags/           lab_ingest + daily_risk_report DAGs (ward_ingest/: DQ, publishing, report)
+api/app/                FastAPI app, repository, models, metrics
+db/init/                roles, databases and numbered SQL migrations
+kafka/                  topic provisioning
+observability/          Prometheus config + alert rules, Grafana provisioning + dashboard generator
+tests/                  local tests; tests/spark, tests/airflow, tests/prometheus run in their images
+docs/                   architecture decision, report notes, demo script
+data/, reports/         runtime data (git-ignored contents)
+```
 
 ## Assumptions and limitations
 
-_To be completed in Step 10._
+- **Synthetic, illustrative only.** Patients, vitals and labs are generated; the NEWS2-style
+  score omits respiratory rate, consciousness and supplemental oxygen and is not clinical.
+- **Single node.** One Kafka broker (RF = 1), Spark in local mode, one Postgres: no fault
+  tolerance against losing the laptop. Production values are in `docs/report_notes.md`.
+- **Replay ordering.** During a Kappa replay the vitals and labs queries run independently, so
+  early replayed windows can be scored before their labs are reloaded.
+- **Report timing.** The daily report waits a bounded time for Spark to load the day's labs;
+  if Spark is down it is produced with the lab status flagged.
+- **Trend latency.** Trend windows are emitted when complete (~4.5 sim-hours ≈ 1 real minute
+  after they open); instantaneous danger is covered by threshold alerts.
+- **Clock.** Simulated time pauses on `make down`; a plain `docker compose down` does not
+  pause it, so simulated days pass while the stack is stopped.
+- **Security.** Local-only: ports bound to 127.0.0.1, plaintext Kafka and Postgres, no API
+  authentication. Secrets come from a generated `.env`.
 
 ## Individual contributions
+
+| Member | Contributions |
+|---|---|
+| _Name_ | _e.g. architecture decision, Kafka ingestion, vitals simulator_ |
+| _Name_ | _e.g. Spark stream processing, scoring rules_ |
+| _Name_ | _e.g. Airflow DAGs, daily report_ |
+| _Name_ | _e.g. API, observability, tests, documentation_ |
 
 _Placeholder — to be completed by the team._

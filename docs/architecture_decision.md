@@ -260,6 +260,7 @@ one container's RAM).
 | `dead_letter` | (`source`, `origin`) — origin is `topic:partition:offset` or `file:row` | Spark (from the `deadletter` topic) | Queryable copy of every rejected record with its `error_reasons`, whichever stage rejected it |
 | `daily_risk_report` | (`report_date`, `patient_id`) | Airflow | Final joined features, base score, lab adjustment, trend adjustment, risk tier |
 | `pipeline_runs` | (`dag_id`, `run_id`, `task_id`, `try_number`) | Airflow task callbacks | Task outcome, duration and error — source for batch success/failure and duration metrics |
+| `daily_risk_report` | (`report_date`, `patient_id`) | Airflow `daily_risk_report` | Per patient per simulated day: vitals features, trend, alerts, latest labs (jsonb), vitals-only tier vs tier with labs, `tier_change` |
 
 All writes are **upserts** (`INSERT … ON CONFLICT … DO UPDATE`) keyed on natural keys, so Spark
 micro-batch retries and Airflow re-runs never duplicate data.
@@ -318,7 +319,7 @@ consistency argument in code.
 
 ---
 
-## 10. Observability plan (detail in Step 8)
+## 10. Observability (implemented — measurements in `docs/report_notes.md` §4–5)
 
 - **Ingestion:** events produced / failed per topic (simulator `/metrics`); lab file DQ results
   recorded in `lab_file_loads`.
@@ -336,7 +337,8 @@ consistency argument in code.
 - **Alert rules (minimum):**
   - `VitalsNotReceived` — no vitals consumed for N real minutes (default 2).
   - `HighInvalidRecordRate` — invalid / total > 5 % over 5 real minutes.
-  - `LabFileLate` — no successful lab load for > 1.5 × `SIM_DAY_SECONDS`.
+  - `LabFileMissing` / `LabFileLate` — yesterday's file not received by 06:00 + 4 h (sim), or > 2 sim-hours late (from the lab ledger, exposed by the API as `ward_lab_file_overdue` / `ward_lab_file_hours_late`).
+  - 12 further rules (source silent, delivery errors, query down, lag, late-drop share, quarantine, task failure, target down, DB down, API errors, high-risk info) — 15 in total, unit-tested with `promtool`.
 - **No Alertmanager:** rules are evaluated by Prometheus and are visible as
   pending/firing on its `/alerts` page and on the Grafana dashboard. Routing to email/pager
   (Alertmanager) is a production improvement, not needed to demonstrate detection.

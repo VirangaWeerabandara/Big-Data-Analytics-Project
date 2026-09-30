@@ -9,7 +9,7 @@ VENV := .venv
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
         topics offsets consume clock-show clock-pause sim-dry \
-        landing lab-day lab-dry stream-status stream-reset spark-test dag-trigger lab-loads venv test
+        landing lab-day lab-dry stream-status stream-reset spark-test dag-trigger lab-loads dashboard test-alerts airflow-test test-all venv test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -93,6 +93,10 @@ dag-trigger: ## Trigger a DAG run now (make dag-trigger d=lab_ingest)
 lab-loads: ## Lab file ledger: arrival, DQ counts, idempotency counters per day
 	@$(PSQL) -c "SELECT file_day, status, arrival, rows_total AS total, rows_valid AS valid, rows_rejected AS rejected, reject_reasons, deliveries, duplicate_deliveries AS dup FROM lab_file_loads ORDER BY file_day;"
 
+# ----------------------------------------------------------- observability
+dashboard: ## Regenerate the Grafana dashboard JSON from build_dashboard.py
+	python3 observability/grafana/build_dashboard.py
+
 # -------------------------------------------------------- stream processing
 stream-status: ## Row counts of the tables the stream job maintains
 	@$(PSQL) -c "SELECT 'vitals_window_1h' AS table_name, count(*) FROM vitals_window_1h UNION ALL SELECT 'vitals_trend_4h', count(*) FROM vitals_trend_4h UNION ALL SELECT 'patient_live_status', count(*) FROM patient_live_status UNION ALL SELECT 'alerts', count(*) FROM alerts UNION ALL SELECT 'lab_results', count(*) FROM lab_results UNION ALL SELECT 'dead_letter', count(*) FROM dead_letter;"
@@ -116,5 +120,15 @@ venv: ## Create a local virtualenv for tests
 	$(VENV)/bin/pip install -q --upgrade pip
 	$(VENV)/bin/pip install -q -r requirements-dev.txt
 
-test: ## Run the unit tests
+test: ## Run the local unit tests (simulators, contracts, scoring, ingestion, report, API, dashboard)
 	$(VENV)/bin/pytest -q
+
+test-alerts: ## Validate Prometheus config and unit-test the alert rules with promtool
+	docker run --rm --entrypoint sh -v .:/src:ro -w /src prom/prometheus:v3.5.1 -c \
+		"promtool check config observability/prometheus/prometheus.yml && promtool test rules tests/prometheus/alert_rules_test.yml"
+
+airflow-test: ## DAG integrity tests inside the Airflow image
+	$(COMPOSE) run --rm --no-deps -v ./tests:/opt/airflow/tests:ro -e PYTHONPATH=/opt/airflow/dags airflow-scheduler \
+		python -m pytest -q -p no:cacheprovider /opt/airflow/tests/airflow
+
+test-all: test spark-test airflow-test test-alerts ## Every test suite (local, Spark, Airflow, alert rules)

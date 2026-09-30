@@ -319,7 +319,12 @@ class StreamJob:
                 conn.commit()
             metrics.ROWS_UPSERTED.labels("vitals_trend_4h").inc(len(rows))
 
-        return self._start(trends, "vitals_trends", sink, self.cfg.trigger)
+        # APPEND mode: each 4 h window is emitted once, complete, after the watermark passes
+        # its end. In update mode an open window was re-scored on every micro-batch while it
+        # filled, so its noisier partial slope got ~10 chances to cross the threshold, and
+        # stable patients drew ~10x the calibrated ~1 % false trend alerts. The cost is
+        # latency: a trend lands ~4.5 simulated hours (~56 real s) after its window opens.
+        return self._start(trends, "vitals_trends", sink, self.cfg.trigger, mode="append")
 
     # --- query 4: labs --------------------------------------------------------------
 
