@@ -20,3 +20,7 @@ scrape_configs:
   - job_name: lab-simulator
     static_configs:
       - targets: ["lab-simulator:8002"]
+
+  - job_name: spark-stream
+    static_configs:
+      - targets: ["spark:8003"]

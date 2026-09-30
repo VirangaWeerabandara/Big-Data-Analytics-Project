@@ -9,7 +9,7 @@ VENV := .venv
 .DEFAULT_GOAL := help
 .PHONY: help env check-env build up down restart ps logs clean migrate psql \
         topics offsets consume clock-show clock-pause spark-smoke sim-dry \
-        landing lab-day lab-dry venv test
+        landing lab-day lab-dry stream-status stream-reset spark-test venv test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -88,6 +88,23 @@ lab-day: ## Drop the lab file for one simulated day now (make lab-day d=2026-01-
 lab-dry: ## Print the lab CSV for one simulated day (make lab-dry d=2026-01-05)
 	@test -n "$(d)" || { echo "usage: make lab-dry d=YYYY-MM-DD"; exit 1; }
 	@$(COMPOSE) run --rm --no-deps lab-simulator python -m ward_sim.lab_generator --day $(d) --dry-run
+
+# -------------------------------------------------------- stream processing
+stream-status: ## Row counts of the tables the stream job maintains
+	@$(PSQL) -c "SELECT 'vitals_window_1h' AS table_name, count(*) FROM vitals_window_1h UNION ALL SELECT 'vitals_trend_4h', count(*) FROM vitals_trend_4h UNION ALL SELECT 'patient_live_status', count(*) FROM patient_live_status UNION ALL SELECT 'alerts', count(*) FROM alerts UNION ALL SELECT 'lab_results', count(*) FROM lab_results UNION ALL SELECT 'dead_letter', count(*) FROM dead_letter;"
+
+stream-reset: ## Kappa replay: wipe derived tables + checkpoints, rebuild everything from Kafka
+	@read -p "Delete stream checkpoints and derived tables, then replay from Kafka? [y/N] " ans && [ "$$ans" = "y" ]
+	$(COMPOSE) stop spark
+	$(PSQL) -c "TRUNCATE vitals_window_1h, vitals_trend_4h, patient_live_status, alerts, lab_results, dead_letter;"
+	find data/checkpoints -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
+	$(COMPOSE) start spark
+
+# Mount the working tree so tests run against current source, not what the image was built with.
+SPARK_TEST_PATH := /src/common:/src/spark/jobs:/src/simulators:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
+spark-test: ## Run the Spark tests inside the Spark image (needs Java, so not in the local venv)
+	$(COMPOSE) run --rm --no-deps -v .:/src:ro -w /src -e PYTHONPATH=$(SPARK_TEST_PATH) \
+		spark python3 -m pytest -q -p no:cacheprovider -c /dev/null --rootdir /src tests/spark
 
 # ----------------------------------------------------------------- tests
 venv: ## Create a local virtualenv for tests

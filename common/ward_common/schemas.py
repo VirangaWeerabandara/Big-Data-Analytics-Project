@@ -59,6 +59,11 @@ def _parse_ts(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _is_number(value: Any) -> bool:
+    # bool is a subclass of int in Python; a JSON `true` is not a heart rate.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def validate_vitals_event(event: Any, known_patients: set[str] | None = None) -> list[str]:
     """Return a list of error codes; an empty list means the event is valid.
 
@@ -84,13 +89,13 @@ def validate_vitals_event(event: Any, known_patients: set[str] | None = None) ->
         value = event.get(name)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if not _is_number(value):
             errors.append(f"type:{name}")
         elif not low <= value <= high:
             errors.append(f"range:{name}")
 
     sbp, dbp = event.get("systolic_bp"), event.get("diastolic_bp")
-    if isinstance(sbp, (int, float)) and isinstance(dbp, (int, float)) and dbp >= sbp:
+    if _is_number(sbp) and _is_number(dbp) and dbp >= sbp:
         errors.append("bp_inverted")
 
     for name in ("timestamp", "produced_at"):
@@ -204,3 +209,31 @@ def validate_lab_row(row: dict, known_patients: set[str] | None = None, file_day
             errors.append("collected_outside_file_day")
 
     return errors
+
+
+# --------------------------------------------------------------------------
+# Kafka message contracts beyond the raw vitals
+# --------------------------------------------------------------------------
+
+# labs.raw: one message per validated CSV row, published by Airflow (Step 5).
+# result_value is sent as a number; everything else as in the CSV.
+LAB_EVENT_FIELDS: tuple[str, ...] = LAB_FILE_COLUMNS + (
+    "schema_version",
+    "source_file",
+    "file_day",     # YYYY-MM-DD the file covers
+    "row_number",   # 1-based data row in the source file
+)
+LAB_EVENT_SCHEMA_VERSION = 1
+
+# deadletter: one message per rejected record, from any stage.
+#   source         "vitals" | "labs"
+#   origin         where the record came from, unique per record, e.g.
+#                  "vitals.raw:3:1234" (topic:partition:offset) or
+#                  "labs_2026-01-04.csv:17" (file:row)
+#   error_reasons  list of stable error codes (see validators above)
+#   raw_payload    the original record as text
+#   detected_by    component that rejected it ("spark", "airflow")
+#   detected_at    real UTC time of rejection
+DEADLETTER_FIELDS: tuple[str, ...] = (
+    "source", "origin", "error_reasons", "raw_payload", "detected_by", "detected_at",
+)

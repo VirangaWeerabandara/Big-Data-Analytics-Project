@@ -11,6 +11,9 @@ ADD --chmod=644 ${MAVEN}/org/apache/spark/spark-sql-kafka-0-10_2.13/4.1.3/spark-
 ADD --chmod=644 ${MAVEN}/org/apache/spark/spark-token-provider-kafka-0-10_2.13/4.1.3/spark-token-provider-kafka-0-10_2.13-4.1.3.jar /opt/spark/jars/
 ADD --chmod=644 ${MAVEN}/org/apache/kafka/kafka-clients/3.9.1/kafka-clients-3.9.1.jar /opt/spark/jars/
 ADD --chmod=644 ${MAVEN}/org/apache/commons/commons-pool2/2.12.1/commons-pool2-2.12.1.jar /opt/spark/jars/
+# JDBC driver: used to read the small lookup tables (patients, lab results, trends)
+# for the stream-static joins. Writes go through psycopg upserts instead.
+ADD --chmod=644 ${MAVEN}/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.jar /opt/spark/jars/
 
 COPY spark/requirements.txt /tmp/requirements.txt
 COPY common /tmp/common

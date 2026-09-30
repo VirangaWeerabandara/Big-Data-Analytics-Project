@@ -223,28 +223,44 @@ services:
       context: .
       dockerfile: spark/Dockerfile
     image: ward-vitals/spark:local
-    # Step 1: runs the connectivity smoke check and exits.
-    # Step 4 switches this to the long-running streaming job.
-    restart: "no"
+    # Long-running streaming job; if a query fails the app exits and Docker
+    # restarts it, and every query resumes from its checkpoint.
+    restart: unless-stopped
     mem_limit: 2g
     logging: *default-logging
     command:
       - /opt/spark/bin/spark-submit
       - --master
       - local[4]
+      # Heap 768 MB is ample (state is a few thousand rows); the rest of the 2 GB
+      # limit covers metaspace, ~500 thread stacks, RocksDB and Python workers.
       - --driver-memory
-      - 1g
+      - 768m
+      - --driver-java-options
+      - -Xss512k -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=128m
       - --conf
       - spark.sql.shuffle.partitions=6
       - --conf
       - spark.ui.showConsoleProgress=false
-      - /opt/app/jobs/smoke_check.py
+      - /opt/app/jobs/stream_processor.py
     environment:
       <<: [*ward-db-env, *clock-env, *kafka-env]
+      TZ: UTC
+      # glibc creates up to 8 x cores malloc arenas for a many-threaded JVM +
+      # RocksDB process, which inflates resident memory; 2 is the usual cap.
+      MALLOC_ARENA_MAX: "2"
+      CHECKPOINT_DIR: /opt/app/checkpoints
+      STREAM_WATERMARK: ${STREAM_WATERMARK:-30 minutes}
+      STREAM_TRIGGER: ${STREAM_TRIGGER:-5 seconds}
+      STREAM_SLOW_TRIGGER: ${STREAM_SLOW_TRIGGER:-15 seconds}
+      STREAM_MAX_OFFSETS_PER_TRIGGER: ${STREAM_MAX_OFFSETS_PER_TRIGGER:-20000}
+      TREND_MIN_READINGS: ${TREND_MIN_READINGS:-20}
+      SPARK_METRICS_PORT: "8003"
     volumes:
       - ./data/checkpoints:/opt/app/checkpoints
     ports:
       - "127.0.0.1:${SPARK_UI_HOST_PORT:-4040}:4040"
+      - "127.0.0.1:${SPARK_METRICS_HOST_PORT:-8003}:8003"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
