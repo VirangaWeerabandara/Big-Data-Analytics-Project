@@ -34,7 +34,9 @@ would duplicate that logic to process about 110 lab rows a day."**
 
 ```bash
 make consume n=3                   # keyed JSON readings on vitals.raw
-make logs s=vitals-simulator | grep deterioration | tail -3
+# `make logs` follows forever (-f), so it never reaches EOF for `tail` to work;
+# query a bounded window instead:
+docker compose logs --no-log-prefix --tail=2000 vitals-simulator | grep deterioration | tail -3
 ```
 
 **"Synthetic patients follow hidden storylines — sepsis, respiratory failure, haemorrhage —
